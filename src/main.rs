@@ -20,10 +20,13 @@ enum Commands {
 
         #[arg(short, long)]
         output: String,
+
+        #[arg(long, default_value_t = false)]
+        create_output: bool,
     },
 
     Send {
-        #[arg( long)]
+        #[arg(long)]
         host: String,
 
         #[arg(short, long)]
@@ -39,8 +42,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Recv { port, output } => {
-            recv::run(*port, output.clone())
+        Commands::Recv {
+            port,
+            output,
+            create_output,
+        } => {
+            recv::run(*port, output.clone(), *create_output)
                 .await
                 .context("Failed to receive file")?;
         }

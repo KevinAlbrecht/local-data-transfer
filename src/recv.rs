@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use get_if_addrs::get_if_addrs;
 use std::error::Error;
 use std::path::Path;
@@ -6,7 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
-pub async fn run(port: u16, output: String) -> Result<()> {
+pub async fn run(port: u16, output: String, create_output: bool) -> Result<()> {
+    check_output_path(&output, create_output)
+        .await
+        .context("Output path check failed")?;
+
     let ip = match get_local_ip() {
         Ok(ip) => ip,
         Err(e) => return Err(anyhow::anyhow!(e.to_string())),
@@ -33,13 +37,41 @@ pub async fn run(port: u16, output: String) -> Result<()> {
     Ok(())
 }
 
+async fn check_output_path(output: &String, should_create: bool) -> Result<()> {
+    let path = Path::new(output);
+    if path.exists() && path.is_dir() {
+        Ok(())
+    } else if !path.exists() {
+        if should_create {
+            tokio::fs::create_dir_all(path)
+                .await
+                .context("Failed to create output directory")?;
+            Ok(())
+        } else {
+            bail!("Output does not exist");
+        }
+    } else {
+        bail!("Output is not a directory");
+    }
+}
+
 async fn read_buffer(mut socket: TcpStream, output: String) -> Result<()> {
-    let mut buffer = Vec::new();
-    socket.read_to_end(&mut buffer).await?;
+    let chunk_size = 64 * 1024;
+    let mut buffer = vec![0u8; chunk_size];
 
-    println!("Received {} bytes", buffer.len());
+    loop {
+        let n = socket
+            .read(&mut buffer)
+            .await?;
 
-    write_in_file(output, &buffer).await?;
+        if n == 0 {
+            break;
+        }
+
+        write_in_file(output.clone(), &buffer[..n])
+            .await
+            .context("Failed to write data to file")?;
+    }
 
     Ok(())
 }
