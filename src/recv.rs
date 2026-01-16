@@ -1,6 +1,7 @@
 use crate::constants;
 use crate::utils;
 use anyhow::{bail, Context, Result};
+use async_compression::tokio::read::GzipDecoder;
 use get_if_addrs::get_if_addrs;
 use std::error::Error;
 use std::path::Path;
@@ -32,7 +33,7 @@ pub async fn run(port: u16, output: String, create_output: bool) -> Result<()> {
 
     println!("Client connected");
 
-    let (filename, _file_size) = read_header(&mut socket)
+    let (filename, _file_size, compression) = read_header(&mut socket)
         .await
         .context("Failed to read file header")?;
 
@@ -40,9 +41,20 @@ pub async fn run(port: u16, output: String, create_output: bool) -> Result<()> {
         .await
         .context("Failed to initialize output file")?;
 
-    read_buffer(socket, file)
-        .await
-        .context("Failed to read data from socket")?;
+    match compression {
+        0 => {
+            read_stream(socket, file)
+                .await
+                .context("Failed to read raw data from socket")?;
+        }
+        1 => {
+            let decoder = GzipDecoder::new(socket);
+            read_stream(decoder, file)
+                .await
+                .context("Failed to read gzip-compressed data")?;
+        }
+        _ => bail!("Unsupported compression type: {}", compression),
+    }
 
     finalize_output_file(output, temp_file_name, filename)
         .await
@@ -69,27 +81,30 @@ async fn check_output_path(output: &String, should_create: bool) -> Result<()> {
     }
 }
 
-async fn read_header(socket: &mut TcpStream) -> Result<(String, u64)> {
+async fn read_header(socket: &mut TcpStream) -> Result<(String, u64, u64)> {
     let mut header = vec![0u8; constants::PACKAGE_HEADER_SIZE];
     socket.read_exact(&mut header).await?;
 
     let file_name_len = u64::from_be_bytes(header[0..8].try_into().unwrap()) as usize;
     let file_size = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let compression = u64::from_be_bytes(header[16..24].try_into().unwrap());
 
     let mut file_name_buf = vec![0u8; file_name_len];
     socket.read_exact(&mut file_name_buf).await?;
     let file_name = String::from_utf8_lossy(&file_name_buf).to_string();
     println!("Receiving file: {} ({} bytes)", file_name, file_size);
 
-    Ok((file_name, file_size))
+    Ok((file_name, file_size, compression))
 }
 
-async fn read_buffer(mut socket: TcpStream, mut file: File) -> Result<()> {
+async fn read_stream<R>(mut reader: R, mut file: File) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buffer = vec![0u8; constants::CHUNK_SIZE];
 
     loop {
-        let n = socket.read(&mut buffer).await?;
-
+        let n = reader.read(&mut buffer).await?;
         if n == 0 {
             break;
         }

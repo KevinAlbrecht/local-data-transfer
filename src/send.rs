@@ -1,11 +1,18 @@
 use crate::constants;
 use anyhow::{bail, Context, Result};
+use async_compression::tokio::write::GzipEncoder;
 use std::path::Path;
 use tokio::fs::metadata;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+
+enum SendMode {
+    Raw,
+    Gzip,
+}
 
 struct FileInfo<'a> {
     path: &'a Path,
@@ -21,11 +28,39 @@ pub async fn run(host: String, port: u16, input: String) -> Result<()> {
         .context("Failed to connect to server")?;
 
     let file_info = get_file_info(&input).await?;
+    let mode = SendMode::Raw;
 
-    write_header(&file_info.name, file_info.size, &mut socket)
-        .await
-        .context("Failed to send file header")?;
-    write_in_chunks(&file_info.path, &mut socket)
+    write_header(
+        &file_info.name,
+        file_info.size,
+        match mode {
+            SendMode::Raw => 0,
+            SendMode::Gzip => 1,
+        },
+        &mut socket,
+    )
+    .await
+    .context("Failed to send file header")?;
+
+    match mode {
+        SendMode::Raw => {
+            write_file_stream(&file_info.path, &mut socket)
+                .await
+                .context("Failed to send file data")?;
+        }
+        SendMode::Gzip => {
+            let mut encoder = GzipEncoder::new(&mut socket);
+            write_file_stream(&file_info.path, &mut encoder)
+                .await
+                .context("Failed to send compressed file data")?;
+            encoder
+                .shutdown()
+                .await
+                .context("Failed to shutdown encoder")?;
+        }
+    }
+
+    write_file_stream(&file_info.path, &mut socket)
         .await
         .context("Failed to send file data")?;
 
@@ -64,13 +99,18 @@ async fn get_file_info(input: &String) -> Result<FileInfo<'_>> {
     })
 }
 
-async fn write_header(file_name: &String, file_size: u64, socket: &mut TcpStream) -> Result<()> {
+async fn write_header(
+    file_name: &String,
+    file_size: u64,
+    compression: u64,
+    socket: &mut TcpStream,
+) -> Result<()> {
     let mut header = vec![0u8; constants::PACKAGE_HEADER_SIZE];
 
     let filename_len = file_name.len() as u64;
     header[0..8].copy_from_slice(&filename_len.to_be_bytes());
     header[8..16].copy_from_slice(&file_size.to_be_bytes());
-    header[16..24].copy_from_slice(&0u64.to_be_bytes());
+    header[16..24].copy_from_slice(&compression.to_be_bytes());
 
     socket
         .write_all(&header)
@@ -85,7 +125,10 @@ async fn write_header(file_name: &String, file_size: u64, socket: &mut TcpStream
     Ok(())
 }
 
-async fn write_in_chunks(path: &Path, socket: &mut TcpStream) -> Result<()> {
+async fn write_file_stream<W>(path: &Path, writer: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut file = File::open(path)
         .await
         .context("Failed to read input file")?;
@@ -99,11 +142,13 @@ async fn write_in_chunks(path: &Path, socket: &mut TcpStream) -> Result<()> {
             break;
         }
 
-        socket
+        writer
             .write_all(&buffer[..n])
             .await
             .context("Failed to write data to socket")?;
     }
+
+    writer.flush().await.context("Failed to flush writer")?;
 
     Ok(())
 }
